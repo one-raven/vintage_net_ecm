@@ -26,6 +26,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmnl-dev
+
       - name: Set up Elixir
         uses: erlef/setup-beam@v1
         with:
@@ -45,7 +50,7 @@ jobs:
       - run: mix deps.get
       - run: mix deps.compile
       - run: mix compile --warnings-as-errors
-      - run: mix test --warnings-as-errors --trace
+      - run: mix test --warnings-as-errors
 
   quality:
     name: Quality (format, credo, dialyzer)
@@ -54,6 +59,11 @@ jobs:
       MIX_ENV: test
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmnl-dev
 
       - name: Set up Elixir
         uses: erlef/setup-beam@v1

@@ -13,7 +13,7 @@ defmodule VintageNetECM.MixProject do
     [
       app: :vintage_net_ecm,
       version: @version,
-      elixir: "~> 1.19",
+      elixir: "~> 1.17",
       start_permanent: Mix.env() == :prod,
       description: @description,
       deps: deps(),

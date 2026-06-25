@@ -16,8 +16,6 @@ defmodule VintageNetECM.AT do
   tolerated but not delivered to a subscriber.
   """
 
-  require Logger
-
   @type uart :: pid()
 
   @default_speed 115_200
