@@ -24,6 +24,14 @@ The vendor-specific AT details live behind the `VintageNetECM.Modem` behaviour.
 The default implementation, `VintageNetECM.Modem.Quectel`, targets Quectel
 `usbnet` ECM modems.
 
+Before choosing this library, review the other cellular modem libraries:
+
+| Library | Data interface | Protocol | Notes |
+| ------- | -------------- | -------  | ----  |
+| [`VintageNetECM`](https://hex.pm/packages/vintage_net_ecm) | USB | AT/CDC-ECM | AT commands for the control path and USB CDC-ECM for data. Newer modems are starting to make this the default. |
+| [`VintageNetMobile`](https://hex.pm/packages/vintage_net_mobile) | UART (direct or over USB) | AT/PPP | Pretty much ever modem supports this, but it can be hard to use due to the control and data links being shared and vendor-specific commands |
+| [`VintageNetQMI`](https://hex.pm/packages/vintage_net_qmi) | USB | QMI | Generic control protocol for modems with a separate data path. Modems generally just work if they support this protocol. |
+
 ## Installation
 
 Add `vintage_net_ecm` to your list of dependencies in `mix.exs`:
