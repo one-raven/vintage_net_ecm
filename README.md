@@ -73,8 +73,71 @@ VintageNet.configure("usb1", %{
 `VintageNetEthernet` options (`:dhcpd`, static `:ipv4`, `:mac_address`) pass
 through to the composed ethernet config.
 
+## Modem, SIM and network information
+
+The AT sidecar publishes what it learns about the modem under
+`["interface", ifname, "mobile", ...]`, so it comes back with the rest of
+VintageNet's properties:
+
+```elixir
+iex> VintageNet.get_by_prefix(["interface", "usb1", "mobile"])
+[
+  {["interface", "usb1", "mobile", "access_technology"], "LTE"},
+  {["interface", "usb1", "mobile", "band"], "LTE BAND 2"},
+  {["interface", "usb1", "mobile", "cell_id"], "B57DE33"},
+  {["interface", "usb1", "mobile", "channel"], 900},
+  {["interface", "usb1", "mobile", "dst_offset"], 3600},
+  {["interface", "usb1", "mobile", "firmware_version"], "EG800QEULCR01A03M04"},
+  {["interface", "usb1", "mobile", "iccid"], "89014103211118510720"},
+  {["interface", "usb1", "mobile", "imei"], "867698041234567"},
+  {["interface", "usb1", "mobile", "imsi"], "310410123456789"},
+  {["interface", "usb1", "mobile", "manufacturer"], "Quectel"},
+  {["interface", "usb1", "mobile", "mcc"], "310"},
+  {["interface", "usb1", "mobile", "mnc"], "410"},
+  {["interface", "usb1", "mobile", "model"], "EG800Q"},
+  {["interface", "usb1", "mobile", "operator"], "AT&T"},
+  {["interface", "usb1", "mobile", "registration"], :registered_home},
+  {["interface", "usb1", "mobile", "rsrp_dbm"], -85},
+  {["interface", "usb1", "mobile", "rsrq_db"], -10},
+  {["interface", "usb1", "mobile", "serial_number"], "BA1234567890"},
+  {["interface", "usb1", "mobile", "signal_dbm"], -79},
+  {["interface", "usb1", "mobile", "sinr_db"], 17},
+  {["interface", "usb1", "mobile", "tac"], "B504"},
+  {["interface", "usb1", "mobile", "timezone"], "-07:00"},
+  {["interface", "usb1", "mobile", "utc_offset"], -25200}
+]
+```
+
+Identity properties (`imei`, `iccid`, ...) are read once and then retried until
+the modem answers; the rest are refreshed every 30 seconds. A property is `nil`
+when the modem couldn't answer for it. See `VintageNetECM.ATController` for
+which AT command each one comes from.
+
+Note that the ESN and MEID aren't reported: those are 3GPP2 (CDMA)
+identifiers, and an LTE-only module like the EG800Q has neither.
+
+## Current time
+
+The time is a live query rather than a property — it would be stale the moment
+it was published:
+
+```elixir
+iex> VintageNetECM.utc_now("usb1")
+{:ok, ~U[2026-08-08 17:04:31Z]}
+
+iex> VintageNetECM.network_time("usb1")
+{:ok, %{utc: ~U[2026-08-08 17:04:31Z], utc_offset: -25200, dst_offset: 3600}}
+```
+
+This is the time the *network* gave the modem over NITZ, so it needs no NTP
+server and no route to the internet. It's only available once the operator has
+sent it — expect `{:error, :not_synchronized}` for the first moments after
+registering, and on networks that don't send NITZ at all.
+
 ## Supporting another modem
 
-Implement the `VintageNetECM.Modem` behaviour and pass it as `:modem`. Only the
-data-call control and access-technology reporting are vendor-specific; the rest
-of the lifecycle uses standard 3GPP commands.
+Implement the `VintageNetECM.Modem` behaviour and pass it as `:modem`. The
+vendor-specific parts are data-call control, access technology, ICCID,
+serving-cell details and network time; the rest of the lifecycle uses standard
+3GPP commands. Callbacks may return `{:error, :unsupported}` for anything the
+modem has no command for.

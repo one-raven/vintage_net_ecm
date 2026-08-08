@@ -7,9 +7,7 @@ defmodule VintageNetECM.AT do
   Minimal AT-command helper over `Circuits.UART` for `VintageNetECM`.
 
   Passive, synchronous request/response: open a tty, send `AT...` lines, and read the
-  response, draining until a final `OK`/`ERROR` (or timeout). This deliberately avoids
-  `vintage_net_mobile`'s `ExChat` so the module stays dependency-free for extraction
-  into `vintage_net_ecm`.
+  response, draining until a final `OK`/`ERROR` (or timeout).
 
   Not for high-throughput or unsolicited-result-code (URC) streaming — it's a probe/
   control channel. Each `command/3` drains stale bytes first, so interleaved URCs are
