@@ -124,6 +124,40 @@ defmodule VintageNetECM do
     }
   end
 
+  @doc """
+  Ask the modem on `ifname` what time the network says it is, in UTC.
+
+      iex> VintageNetECM.utc_now("usb1")
+      {:ok, ~U[2026-08-08 17:04:31Z]}
+
+  This is a live AT query rather than a published property, so it costs a round trip
+  to the modem and can fail: `{:error, :not_running}` if `ifname` isn't configured for
+  `VintageNetECM`, `{:error, :not_synchronized}` if the modem hasn't picked the time up
+  from the network yet.
+
+  The local timezone is published as `["interface", ifname, "mobile", "timezone"]` —
+  see `VintageNetECM.ATController` for the full property list.
+  """
+  @spec utc_now(VintageNet.ifname()) :: {:ok, DateTime.t()} | {:error, term()}
+  def utc_now(ifname) do
+    with {:ok, %{utc: utc}} <- VintageNetECM.ATController.network_time(ifname) do
+      {:ok, utc}
+    end
+  end
+
+  @doc """
+  Like `utc_now/1`, but also reports the network's timezone.
+
+      iex> VintageNetECM.network_time("usb1")
+      {:ok, %{utc: ~U[2026-08-08 17:04:31Z], utc_offset: -25200, dst_offset: 3600}}
+
+  `:utc_offset` is the local timezone's offset from UTC in seconds, of which
+  `:dst_offset` seconds are daylight saving.
+  """
+  @spec network_time(VintageNet.ifname()) ::
+          {:ok, VintageNetECM.Modem.network_time()} | {:error, term()}
+  defdelegate network_time(ifname), to: VintageNetECM.ATController
+
   @impl VintageNet.Technology
   def ioctl(_ifname, _command, _args), do: {:error, :unsupported}
 
