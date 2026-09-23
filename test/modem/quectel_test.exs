@@ -112,13 +112,14 @@ defmodule VintageNetECM.Modem.QuectelTest do
 
   describe "parse_network_time/1" do
     test "reads the GMT timestamp and the local offset" do
-      assert Quectel.parse_network_time(["+QLTS: \"2017/10/13,03:41:22+32\",0"]) ==
+      assert Quectel.parse_network_time(["+QLTS: \"2017/10/13,03:41:22+32,0\""]) ==
                {:ok, %{utc: ~U[2017-10-13 03:41:22Z], utc_offset: 8 * 60 * 60, dst_offset: 0}}
     end
 
     test "reports the daylight-saving part of the offset" do
-      assert {:ok, %{utc_offset: -25_200, dst_offset: 3600}} =
-               Quectel.parse_network_time(["+QLTS: \"2026/08/08,17:04:31-28\",1"])
+      # America/Denver in the summer: UTC-6, one hour of which is DST.
+      assert {:ok, %{utc_offset: -21_600, dst_offset: 3600}} =
+               Quectel.parse_network_time(["+QLTS: \"2026/08/08,17:04:31-24,1\""])
     end
 
     test "tolerates a missing dst field" do

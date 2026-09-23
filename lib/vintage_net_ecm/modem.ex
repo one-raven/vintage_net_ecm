@@ -67,9 +67,13 @@ defmodule VintageNetECM.Modem do
   @typedoc """
   Network-supplied time, as reported by `c:network_time/1`.
 
-    * `:utc` — the current time in UTC,
-    * `:utc_offset` — the local timezone's offset from UTC, in seconds,
-    * `:dst_offset` — the daylight-saving part of `:utc_offset`, in seconds.
+    * `:utc` - the current time in UTC
+    * `:utc_offset` - the local timezone's current offset from UTC, in seconds.
+      This includes the DST offset if DST is in effect (so for America/Denver,
+      it will be -21600 in the summer and -25200 in the winter)
+    * `:dst_offset` - the daylight-saving part of `:utc_offset`, in seconds.
+      **NOTE:** this is always 0 when DST is not in effect, even if the local
+      timezone observes DST at other times of the year
   """
   @type network_time :: %{
           utc: DateTime.t(),
