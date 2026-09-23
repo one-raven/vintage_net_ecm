@@ -158,6 +158,38 @@ defmodule VintageNetECM do
           {:ok, VintageNetECM.Modem.network_time()} | {:error, term()}
   defdelegate network_time(ifname), to: VintageNetECM.ATController
 
+  @doc """
+  Send an arbitrary AT command to the modem on `ifname` and return its response.
+
+      iex> VintageNetECM.command("usb1", "AT+CGMI")
+      {:ok, ["Quectel"]}
+
+      iex> VintageNetECM.command("usb1", "AT+QENG=\\"servingcell\\"", timeout: 10_000)
+      {:ok, ["+QENG: \\"servingcell\\",\\"NOCONN\\",\\"LTE\\",..."]}
+
+  The command is sent over the AT tty that `VintageNetECM.ATController` already owns,
+  serialized with its own traffic, so there's no second connection to contend with.
+  The response lines come back with the command echo and the final `OK` stripped.
+
+  Errors are `{:error, {:cme, detail}}` / `{:error, {:cms, detail}}` for extended
+  errors, `{:error, :error}` for a bare `ERROR`, `{:error, :timeout}` if the modem
+  doesn't finish answering in time, `{:error, :tty_not_open}` while the controller is
+  still (re)opening the tty, and `{:error, :not_running}` if `ifname` isn't configured
+  for `VintageNetECM`.
+
+  Be careful with commands that change modem state (`AT+CFUN`, `AT+CGDCONT`, data-call
+  control, ...): the controller doesn't know about them and may undo or be confused by
+  them.
+
+  ## Options
+
+    * `:timeout` - milliseconds to wait for the modem's final result code (default
+      `5_000`). Raise it for slow commands such as `AT+COPS=?`.
+  """
+  @spec command(VintageNet.ifname(), String.t(), keyword()) ::
+          {:ok, [String.t()]} | {:error, term()}
+  defdelegate command(ifname, cmd, opts \\ []), to: VintageNetECM.ATController
+
   @impl VintageNet.Technology
   def ioctl(_ifname, _command, _args), do: {:error, :unsupported}
 
