@@ -134,6 +134,22 @@ server and no route to the internet. It's only available once the operator has
 sent it — expect `{:error, :not_synchronized}` for the first moments after
 registering, and on networks that don't send NITZ at all.
 
+## Sending AT commands
+
+`VintageNetECM.command/3` sends an arbitrary AT command over the tty the
+controller already owns and returns the response lines:
+
+```elixir
+iex> VintageNetECM.command("usb1", "AT+CGMI")
+{:ok, ["Quectel"]}
+
+iex> VintageNetECM.command("usb1", "AT+COPS=?", timeout: 180_000)
+{:ok, ["+COPS: (1,\"T-Mobile\",\"T-Mobile\",\"310260\",7),..."]}
+```
+
+Avoid commands that change state the controller manages (`AT+CFUN`,
+`AT+CGDCONT`, data-call control), since it may undo them.
+
 ## Supporting another modem
 
 Implement the `VintageNetECM.Modem` behaviour and pass it as `:modem`. The

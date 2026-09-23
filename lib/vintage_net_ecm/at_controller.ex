@@ -105,6 +105,22 @@ defmodule VintageNetECM.ATController do
   end
 
   @doc """
+  Send an arbitrary AT command to the modem on `ifname` and return its response.
+
+  Like `network_time/1`, the command goes through this GenServer so it's serialized
+  with the lifecycle's own AT traffic. See `VintageNetECM.command/3`.
+  """
+  @spec command(VintageNet.ifname(), String.t(), keyword()) ::
+          {:ok, [String.t()]} | {:error, term()}
+  def command(ifname, cmd, opts \\ []) do
+    timeout = Keyword.get(opts, :timeout, 5_000)
+    # Leave headroom over the AT timeout for a command already in flight on the tty.
+    GenServer.call(via(ifname), {:command, cmd, timeout}, timeout + 10_000)
+  catch
+    :exit, _reason -> {:error, :not_running}
+  end
+
+  @doc """
   Tear the modem's ECM data call down. Invoked from `VintageNetECM` `down_cmds`, where
   the controller GenServer is already gone — so this opens its own short-lived UART and
   delegates the actual command to the `VintageNetECM.Modem` implementation.
@@ -188,12 +204,16 @@ defmodule VintageNetECM.ATController do
   end
 
   @impl GenServer
-  def handle_call(:network_time, _from, %{uart: nil} = state) do
+  def handle_call(_request, _from, %{uart: nil} = state) do
     {:reply, {:error, :tty_not_open}, state}
   end
 
   def handle_call(:network_time, _from, state) do
     {:reply, network_time(state.modem, state.uart), state}
+  end
+
+  def handle_call({:command, cmd, timeout}, _from, state) do
+    {:reply, AT.command(state.uart, cmd, timeout: timeout), state}
   end
 
   # --- modem interactions -------------------------------------------------------
