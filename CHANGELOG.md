@@ -10,6 +10,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.2.1]
+
+* Added
+  * `VintageNetECM.command/3` for sending arbitrary AT commands to the modem [#3](https://github.com/one-raven/vintage_net_ecm/issues/3)
+
+* Fixed
+  * Parse the DST field of the Quectel `AT+QLTS` response, which is inside the quoted string rather than after it as the AT manual shows. `dst_offset` was previously always 0 [#4](https://github.com/one-raven/vintage_net_ecm/issues/4)
+
 ## [v0.2.0]
 
 * Added
