@@ -202,7 +202,7 @@ defmodule VintageNetECM.Modem.Quectel do
   defp serving_cell_info(_fields), do: %{}
 
   @doc false
-  # `+QLTS: "<time>",<dst>` where <time> is "YYYY/MM/DD,hh:mm:ss±zz" — GMT for
+  # `+QLTS: "<time>,<dst>"` where <time> is "YYYY/MM/DD,hh:mm:ss±zz" — GMT for
   # `AT+QLTS=1` — and ±zz is the *local* offset in quarter hours. <dst> is how many
   # hours of that offset are daylight saving. An empty time string means the modem
   # has not synchronized with the network yet.
@@ -212,7 +212,7 @@ defmodule VintageNetECM.Modem.Quectel do
     fields =
       Enum.find_value(lines, fn line ->
         Regex.run(
-          ~r/\+QLTS:\s*"(\d{4})\/(\d{2})\/(\d{2}),(\d{2}):(\d{2}):(\d{2})([+-]\d+)"(?:,(\d+))?/,
+          ~r/\+QLTS:\s*"(\d{4})\/(\d{2})\/(\d{2}),(\d{2}):(\d{2}):(\d{2})([+-]\d+)(?:,(\d+))?"/,
           line,
           capture: :all_but_first
         )
@@ -223,7 +223,7 @@ defmodule VintageNetECM.Modem.Quectel do
         build_network_time(
           Enum.map([year, month, day, hour, minute, second], &String.to_integer/1),
           String.to_integer(quarter_hours),
-          # The `,<dst>` group is optional and comes back as "" when it didn't match.
+          # The `,<dst>` group is optional, so it may be missing from the captures.
           dst |> List.first("") |> integer_or_zero()
         )
 
