@@ -5,7 +5,7 @@
 defmodule VintageNetECM.MixProject do
   use Mix.Project
 
-  @version "0.2.1"
+  @version "0.2.2"
   @description "VintageNet technology for USB CDC-ECM cellular modems (e.g. Quectel EG800Q)"
   @source_url "https://github.com/one-raven/vintage_net_ecm"
 
