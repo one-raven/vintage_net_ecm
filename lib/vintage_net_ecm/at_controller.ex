@@ -194,9 +194,9 @@ defmodule VintageNetECM.ATController do
     state = refresh_static_properties(state)
     publish(state)
 
-    unless state.modem.data_call_active?(state.uart) do
+    if registered?(state.uart) and not state.modem.data_call_active?(state.uart) do
       Logger.info("[VintageNetECM] #{state.ifname}: data call down; re-activating")
-      if registered?(state.uart), do: activate_data_call(state)
+      activate_data_call(state)
     end
 
     Process.send_after(self(), :monitor, @monitor_interval)

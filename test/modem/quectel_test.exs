@@ -19,15 +19,29 @@ defmodule VintageNetECM.Modem.QuectelTest do
   end
 
   describe "parse_data_call_active/1" do
-    test "true when QNETDEVCTL reports state 1" do
-      assert Quectel.parse_data_call_active(["+QNETDEVCTL: 1,1,1"])
+    test "true when the call is connected (state 2)" do
+      assert Quectel.parse_data_call_active(["+QNETDEVSTATUS: 0,2,4,1"])
+      assert Quectel.parse_data_call_active(["+QNETDEVSTATUS: 1,2,4,1"])
     end
 
-    test "false when QNETDEVCTL reports state 0" do
-      refute Quectel.parse_data_call_active(["+QNETDEVCTL: 0,1,1"])
+    test "true when the call is ready for DHCP (state 1)" do
+      assert Quectel.parse_data_call_active(["+QNETDEVSTATUS: 1,1,4,1"])
     end
 
-    test "false when there is no QNETDEVCTL line" do
+    test "false when the call is disconnected (state 0)" do
+      refute Quectel.parse_data_call_active(["+QNETDEVSTATUS: 1,0,4,1"])
+    end
+
+    test "false when no call exists" do
+      refute Quectel.parse_data_call_active(["+QNETDEVSTATUS: 0"])
+      refute Quectel.parse_data_call_active(["+QNETDEVSTATUS: 1"])
+    end
+
+    test "false for a QNETDEVCTL line, which reports the requested op, not the call" do
+      refute Quectel.parse_data_call_active(["+QNETDEVCTL: 1,1,1,0"])
+    end
+
+    test "false when there is no QNETDEVSTATUS line" do
       refute Quectel.parse_data_call_active(["+CEREG: 2,1"])
       refute Quectel.parse_data_call_active([])
     end

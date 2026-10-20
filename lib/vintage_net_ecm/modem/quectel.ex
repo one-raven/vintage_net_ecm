@@ -9,7 +9,8 @@ defmodule VintageNetECM.Modem.Quectel do
 
   Quectel exposes a handful of proprietary commands that this module wraps:
 
-    * `AT+QNETDEVCTL` — bring the ECM data call up/down and query its state,
+    * `AT+QNETDEVCTL` — bring the ECM data call up/down,
+    * `AT+QNETDEVSTATUS` — whether the ECM data call is connected,
     * `AT+QCSQ` — report the radio access technology (system mode),
     * `AT+QCCID` — read the (U)SIM's ICCID,
     * `AT+QENG="servingcell"` — MCC/MNC, cell ID, TAC and serving-cell signal
@@ -31,12 +32,19 @@ defmodule VintageNetECM.Modem.Quectel do
 
   # QNETDEVCTL params: <op 0|1|3>, <context 1-15>, <urc 0|1>. 1 = activate, 0 = deactivate.
   # (`AT+QNETDEVCTL=?` on the EG800Q-NA reports `(0-1,3),(1-15),(0-1)`.)
+  # `AT+QNETDEVCTL?` reports the <op> last asked for, not whether the call is up
+  # (EG800Q&EG91xQ AT Commands Manual V1.1, §9.13), so the call's state comes from
+  # `AT+QNETDEVSTATUS?` (§9.11).
 
   @impl VintageNetECM.Modem
   def default_at_tty, do: "ttyUSB2"
 
   @impl VintageNetECM.Modem
   def activate_data_call(uart, context_id) do
+    # A call the network dropped can still read as asked up, so it is asked down
+    # first and every request starts from no call.
+    _ = AT.command(uart, "AT+QNETDEVCTL=0,#{context_id},1", timeout: 5_000)
+
     case AT.command(uart, "AT+QNETDEVCTL=1,#{context_id},1", timeout: 8_000) do
       {:ok, _} -> :ok
       {:error, reason} -> {:error, reason}
@@ -51,9 +59,12 @@ defmodule VintageNetECM.Modem.Quectel do
 
   @impl VintageNetECM.Modem
   def data_call_active?(uart) do
-    case AT.command(uart, "AT+QNETDEVCTL?", timeout: 2_000) do
+    case AT.command(uart, "AT+QNETDEVSTATUS?", timeout: 2_000) do
       {:ok, lines} -> parse_data_call_active(lines)
-      _ -> false
+      # No answer says nothing about the call, and re-dialling would take a
+      # working call down first. An error answer counts as down.
+      {:error, :timeout} -> true
+      {:error, _} -> false
     end
   end
 
@@ -102,11 +113,16 @@ defmodule VintageNetECM.Modem.Quectel do
   end
 
   @doc false
-  # `+QNETDEVCTL: <state>,...` — state 1 means the data call is up.
+  # `+QNETDEVSTATUS: <on_off>[,<state>[,<IP_type>[,<instance>]]]` — <state> is
+  # present only while a call exists: 1 means it is ready for DHCP, 2 that it is
+  # connected. Both count as up, so a call is not reset while DHCP runs.
   @spec parse_data_call_active([String.t()]) :: boolean()
   def parse_data_call_active(lines) do
     Enum.any?(lines, fn line ->
-      match?([_, "1"], Regex.run(~r/\+QNETDEVCTL:\s*(\d+)/, line))
+      match?(
+        [_, state] when state in ["1", "2"],
+        Regex.run(~r/\+QNETDEVSTATUS:\s*\d+,(\d+)/, line)
+      )
     end)
   end
 
