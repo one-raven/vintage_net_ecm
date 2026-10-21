@@ -11,7 +11,7 @@ defmodule VintageNetECM.ATController do
     1. Open the AT tty.
     2. Configure the radio: `ATE0`, verbose errors, `AT+CEREG=2`, `AT+CFUN=1`, set the
        APN (`AT+CGDCONT`), automatic operator selection (`AT+COPS=0`).
-    3. Poll `AT+CEREG?` until registered (stat 1 = home or 5 = roaming).
+    3. Poll registration until registered (see `parse_registered?/1`).
     4. Bring the ECM data call up via the `VintageNetECM.Modem` implementation. DHCP on
        the netdev — run by the composed `VintageNetEthernet` config — then obtains the
        lease.
@@ -251,10 +251,15 @@ defmodule VintageNetECM.ATController do
     end
   end
 
+  # The three registration reports, the packet attach and the operator in one
+  # exchange; a modem that refuses any of them on one line is asked `AT+CEREG?` alone.
   defp registered?(uart) do
-    case AT.command(uart, "AT+CEREG?", timeout: 2_000) do
+    with {:error, _} <-
+           AT.command(uart, "AT+CEREG?;+CGREG?;+CREG?;+CGATT?;+COPS?", timeout: 2_000),
+         {:error, _} <- AT.command(uart, "AT+CEREG?", timeout: 2_000) do
+      false
+    else
       {:ok, lines} -> parse_registered?(lines)
-      _ -> false
     end
   end
 
@@ -399,10 +404,15 @@ defmodule VintageNetECM.ATController do
           | :not_registered
 
   @doc false
-  # `+CEREG: <n>,<stat>` — stat 1 (home) or 5 (roaming) means registered.
+  # Registered: any of `+CEREG`, `+CGREG` or `+CREG` at stat 1 (home) or 5 (roaming),
+  # or `+CGATT: 1` with an operator in `+COPS`. A modem can stay attached and carry
+  # data while every registration report reads searching (2), as a Quectel EG800Q
+  # does when a manual selection cuts short its automatic search and automatic
+  # selection is then restored.
   @spec parse_registered?([String.t()]) :: boolean()
   def parse_registered?(lines) do
-    parse_cereg_stat(lines) in ["1", "5"]
+    Enum.any?(lines, &Regex.match?(~r/^\+C(E|G)?REG:\s*\d+,[15](,|$)/, &1)) or
+      ("+CGATT: 1" in lines and Enum.any?(lines, &Regex.match?(~r/^\+COPS:\s*\d,\d,"/, &1)))
   end
 
   @doc false

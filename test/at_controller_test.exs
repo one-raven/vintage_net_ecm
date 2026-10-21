@@ -13,6 +13,24 @@ defmodule VintageNetECM.ATControllerTest do
       assert ATController.parse_registered?(["+CEREG: 2,5,\"1A2B\",\"00C3D4E5\",7"])
     end
 
+    test "true for CGREG or CREG at home or roaming" do
+      assert ATController.parse_registered?(["+CEREG: 2,2", "+CGREG: 0,5", "+CREG: 0,2"])
+      assert ATController.parse_registered?(["+CEREG: 2,2", "+CREG: 0,1"])
+    end
+
+    test "true when attached with an operator, whatever the registration reports say" do
+      assert ATController.parse_registered?([
+               "+CEREG: 2,2",
+               "+CGREG: 0,2",
+               "+CREG: 0,2",
+               "+CGATT: 1",
+               ~s(+COPS: 0,0,"T-Mobile",7)
+             ])
+
+      refute ATController.parse_registered?(["+CEREG: 2,2", "+CGATT: 1", "+COPS: 0"])
+      refute ATController.parse_registered?(["+CEREG: 2,2", "+CGATT: 0", ~s(+COPS: 0,0,"AT&T",7)])
+    end
+
     test "false for searching/denied/not-registered and when absent" do
       refute ATController.parse_registered?(["+CEREG: 2,2"])
       refute ATController.parse_registered?(["+CEREG: 2,0"])
