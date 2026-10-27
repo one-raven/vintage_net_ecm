@@ -23,11 +23,21 @@ defmodule VintageNetECM.AT do
   def open(tty, opts \\ []) do
     speed = Keyword.get(opts, :speed, @default_speed)
 
-    with {:ok, uart} <- Circuits.UART.start_link(),
-         :ok <- Circuits.UART.open(uart, tty, speed: speed, active: false) do
-      {:ok, uart}
-    else
+    case Circuits.UART.start_link() do
+      {:ok, uart} -> open_uart(uart, tty, speed)
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp open_uart(uart, tty, speed) do
+    case Circuits.UART.open(uart, tty, speed: speed, active: false) do
+      :ok ->
+        {:ok, uart}
+
+      {:error, reason} ->
+        # Stop the UART process, or each failed open leaves one (and its port) running.
+        _ = Circuits.UART.stop(uart)
+        {:error, reason}
     end
   end
 

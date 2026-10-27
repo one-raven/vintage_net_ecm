@@ -51,5 +51,11 @@ defmodule VintageNetECM.ATTest do
     test "returns an error for a tty that does not exist" do
       assert {:error, _reason} = AT.open("/dev/definitely-not-a-real-tty")
     end
+
+    test "stops the UART process when the tty does not open" do
+      {:links, before} = Process.info(self(), :links)
+      assert {:error, _reason} = AT.open("/dev/definitely-not-a-real-tty")
+      assert Process.info(self(), :links) == {:links, before}
+    end
   end
 end
