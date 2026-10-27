@@ -10,6 +10,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.2.2]
+
+* Fixed
+  * Read the Quectel data call's state from AT+QNETDEVSTATUS [#5](https://github.com/one-raven/vintage_net_ecm/pull/5)
+  * Stop the UART process when the tty fails to open. A missing or resetting
+    modem previously leaked a `Circuits.UART` process and port program on
+    every 5 s retry [#6](https://github.com/one-raven/vintage_net_ecm/pull/6)
+  * Count a modem attached with an operator as registered. Registration is now
+    any of `+CEREG`, `+CGREG` or `+CREG` at stat 1 or 5, or `+CGATT: 1` with an
+    operator in `+COPS`, so a working link that reads as searching (as on a
+    Quectel EG800Q) still gets its data call activated and re-dialled
+    [#8](https://github.com/one-raven/vintage_net_ecm/pull/8)
+
 ## [v0.2.1]
 
 * Added
