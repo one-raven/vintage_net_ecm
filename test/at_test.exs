@@ -47,15 +47,91 @@ defmodule VintageNetECM.ATTest do
     end
   end
 
-  describe "open/2" do
-    test "returns an error for a tty that does not exist" do
-      assert {:error, _reason} = AT.open("/dev/definitely-not-a-real-tty")
+  describe "parse_response/2" do
+    test "buffers every possible split of a final response" do
+      packet = "+CSQ: 17,99\nOK\n"
+
+      for split <- 0..(byte_size(packet) - 1) do
+        prefix = binary_part(packet, 0, split)
+        assert AT.parse_response(prefix, []) == :more
+      end
+
+      assert AT.parse_response(packet, []) == {:ok, {:response, ["+CSQ: 17,99", "OK"]}, ""}
     end
 
-    test "stops the UART process when the tty does not open" do
-      {:links, before} = Process.info(self(), :links)
-      assert {:error, _reason} = AT.open("/dev/definitely-not-a-real-tty")
-      assert Process.info(self(), :links) == {:links, before}
+    test "intermediate markers require their complete configured framing" do
+      for marker <- ["> ", "DOWNLOAD\r\n"], split <- 0..(byte_size(marker) - 1) do
+        assert AT.parse_response(binary_part(marker, 0, split), [marker]) == :more
+        assert AT.parse_response(marker, [marker]) == {:ok, {:intermediate, marker}, ""}
+      end
+    end
+
+    test "consumes lines before a marker and retains bytes after it" do
+      assert AT.parse_response("AT+X\r\n \r\n> ERROR\n", ["> "]) ==
+               {:ok, {:intermediate, "> "}, "ERROR\n"}
+
+      assert AT.parse_response("OK\n+NOTICE: 1\n", []) ==
+               {:ok, {:response, ["OK"]}, "+NOTICE: 1\n"}
+    end
+
+    test "markers inside response lines are data, not boundaries" do
+      assert AT.parse_response("VALUE: > \nOK\n", ["> "]) ==
+               {:ok, {:response, ["VALUE: > ", "OK"]}, ""}
+
+      assert AT.parse_response("> ", []) == :more
+    end
+
+    test "recognizes final errors without interpreting their content" do
+      for line <- [
+            "ERROR",
+            "+CME ERROR: 30",
+            "+CMS ERROR: 305",
+            "NO CARRIER",
+            "BUSY",
+            "NO ANSWER"
+          ] do
+        assert AT.parse_response(line <> "\n", []) == {:ok, {:response, [line]}, ""}
+      end
+    end
+
+    test "retains response data that starts with CONNECT but is not the result code" do
+      for line <- ["CONNECTED", "CONNECTIVITY"] do
+        assert AT.parse_response(line <> "\r\nOK\r\n", []) ==
+                 {:ok, {:response, [line, "OK"]}, "\n"}
+      end
+    end
+
+    test "rejects data mode and bounds complete and incomplete responses" do
+      for line <- ["CONNECT", "CONNECT 115200"] do
+        assert AT.parse_response(line <> "\n", []) == {:error, :unsupported_data_mode}
+      end
+
+      for bytes <- [String.duplicate("x", 16_385), String.duplicate("x\n", 8_193) <> "OK\n"] do
+        assert AT.parse_response(bytes, []) == {:error, :response_too_large}
+      end
+    end
+
+    test "validates markers once without ambiguous or reserved prefixes" do
+      assert AT.validate_intermediate_responses(["> ", "DOWNLOAD\r\n"]) == :ok
+
+      for markers <- [
+            nil,
+            [:bad],
+            [""],
+            [" "],
+            [">", "> "],
+            ["> ", "> "],
+            ["OK"],
+            ["CONNECT"],
+            ["+CMS ERROR:"],
+            ["\r\n> "],
+            ["A\r\nB"],
+            [String.duplicate("x", 129)],
+            List.duplicate("> ", 33)
+          ] do
+        assert AT.validate_intermediate_responses(markers) ==
+                 {:error, :invalid_intermediate_responses}
+      end
     end
   end
 end

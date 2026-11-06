@@ -68,6 +68,7 @@ VintageNet.configure("usb1", %{
   `VintageNetECM.Modem.Quectel`).
 * `:at_tty` — the AT control tty (defaults to the modem's `default_at_tty/0`).
 * `:context_id` — the PDP context id (defaults to `1`).
+* `:intermediate_responses` — exact intermediate markers, e.g. `["> "]` (default `[]`).
 
 `:ipv4` defaults to `%{method: :dhcp}` — the only sensible mode for ECM. Other
 `VintageNetEthernet` options (`:dhcpd`, static `:ipv4`, `:mac_address`) pass
@@ -136,8 +137,8 @@ registering, and on networks that don't send NITZ at all.
 
 ## Sending AT commands
 
-`VintageNetECM.command/3` sends an arbitrary AT command over the tty the
-controller already owns and returns the response lines:
+`VintageNetECM.command/3` sends an arbitrary AT command through the supervised
+AT channel and returns the response lines:
 
 ```elixir
 iex> VintageNetECM.command("usb1", "AT+CGMI")
@@ -149,6 +150,70 @@ iex> VintageNetECM.command("usb1", "AT+COPS=?", timeout: 180_000)
 
 Avoid commands that change state the controller manages (`AT+CFUN`,
 `AT+CGDCONT`, data-call control), since it may undo them.
+
+## Interactive sessions (unreleased)
+
+Use `session/3` when a command needs more than one exchange, such as waiting for
+an SMS prompt before sending its payload. `AT.send/2` writes exact bytes;
+`AT.receive/2` waits for a configured intermediate marker or a final response.
+
+For standalone use, add a channel to your application's supervision tree. No
+VintageNet interface configuration or manual opening/closing is needed:
+
+```elixir
+children = [
+  {VintageNetECM.AT.Channel,
+   tty: "/dev/ttyUSB2", name: MyApp.Modem, intermediate_responses: ["> "]}
+]
+Supervisor.start_link(children, strategy: :one_for_one)
+
+alias VintageNetECM.AT
+AT.session(MyApp.Modem, fn at -> AT.command(at, "AT+CGMI") end)
+```
+
+Use enabled textual result codes (`ATQ0V1`). Standalone channels do not change
+radio settings. For an interactive command, the application chooses the command,
+payload and response interpretation:
+
+```elixir
+AT.session(MyApp.Modem, fn at ->
+  with :ok <- AT.send(at, command <> "\r"),
+       {:ok, {:intermediate, "> "}} <- AT.receive(at),
+       :ok <- AT.send(at, payload),
+       {:ok, {:response, lines}} <- AT.receive(at, timeout: 120_000) do
+    {:ok, lines}
+  end
+end, timeout: 130_000)
+```
+
+For a modem managed by VintageNet, configure `:intermediate_responses` and call
+`VintageNetECM.session("usb1", callback, opts)` instead. Radio initialization
+finishes before managed sessions are admitted. Polling leases the same channel
+and defers while an application session owns it. Competing sessions return
+`{:error, :busy}`; requests may wait behind an in-progress, deadline-bounded UART
+read. Do not create a second channel for its tty or an alias of that tty.
+
+Markers are exact byte sequences, including spaces and line endings (at most 32
+unambiguous markers of 1–128 bytes). A `:response` includes the final result, even
+on modem errors; an `:intermediate` means the exchange is still pending.
+Unsolicited lines remain in responses, not a separate subscription. `CONNECT`/
+data mode is unsupported. Response buffering is bounded to 16,384 bytes.
+
+The session timeout (default 5,000 ms) bounds UART access, not callback execution;
+per-operation timeouts cannot extend it. Handles belong to the callback's PID.
+Unfinished exchanges, response timeouts and I/O failures fence further traffic
+with `{:error, :desynchronized}`. Lost calls return `{:error, :outcome_unknown}`.
+Never automatically retry uncertain writes.
+
+After explicitly recovering the modem's protocol state, call
+`VintageNetECM.AT.Channel.recover(channel)` to reopen the UART and discard stale
+input. Reopening or restarting a supervisor is not itself modem recovery, does
+not cancel pending modem operations, and must not be used as an automatic retry.
+Initial tty-open failures retry without sending commands; failures after an
+exchange has begun require explicit recovery. See `VintageNetECM.AT` for the
+full session contract.
+
+Tests require `socat` to exercise real pseudo-terminals (`mix test`).
 
 ## Supporting another modem
 

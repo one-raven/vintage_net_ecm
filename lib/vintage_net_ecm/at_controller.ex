@@ -4,67 +4,30 @@
 
 defmodule VintageNetECM.ATController do
   @moduledoc """
-  Supervised AT-control sidecar for `VintageNetECM`.
+  Modem management for `VintageNetECM` over a supervised AT channel.
 
-  Started by VintageNet (as a `child_spec`) once the ECM netdev is present. Lifecycle:
+  Initializes the radio and APN, waits for registration, activates the ECM data
+  call, and publishes modem/SIM identity and network information under
+  `["interface", ifname, "mobile", ...]`. Identity properties are retried until
+  known; registration, signal, operator, technology, serving-cell details and
+  timezone are refreshed every 30 seconds. Current time is a live query through
+  `VintageNetECM.network_time/1`, not a stale property.
 
-    1. Open the AT tty.
-    2. Configure the radio: `ATE0`, verbose errors, `AT+CEREG=2`, `AT+CFUN=1`, set the
-       APN (`AT+CGDCONT`), automatic operator selection (`AT+COPS=0`).
-    3. Poll registration until registered (see `parse_registered?/1`).
-    4. Bring the ECM data call up via the `VintageNetECM.Modem` implementation. DHCP on
-       the netdev — run by the composed `VintageNetEthernet` config — then obtains the
-       lease.
-    5. Publish the modem/SIM identity (see `t:property/0`) once, retrying anything the
-       modem wasn't ready to answer.
-    6. Periodically publish registration, signal, technology and serving-cell details
-       under `["interface", ifname, "mobile", ...]` and re-activate the data call if it
-       drops.
+  Every operation leases the same channel as application sessions. Busy or
+  unavailable channels defer polling without discarding controller state.
+  External managed sessions are admitted only after radio initialization.
 
-  Steps 1-3 and the identity/registration/signal reporting use standard 3GPP commands
-  handled here. The vendor-specific bits — data-call control, access technology, ICCID,
-  serving-cell info and network time — are delegated to the configured
-  `VintageNetECM.Modem` implementation (defaulting to `VintageNetECM.Modem.Quectel`).
-
-  Teardown is handled out-of-band by `deactivate_data_call/3` (a `VintageNetECM`
-  `down_cmds` `:fun`), because VintageNet kills this process *before* running down_cmds,
-  so `terminate/2` is not a reliable place to talk to the modem.
-
-  ## Published properties
-
-  Everything is published under `["interface", ifname, "mobile", ...]`. A property is
-  `nil` when the modem couldn't answer for it.
-
-  | Property | Source |
-  | -------- | ------ |
-  | `"manufacturer"`, `"model"`, `"firmware_version"` | `AT+CGMI` / `AT+CGMM` / `AT+CGMR` |
-  | `"imei"`, `"serial_number"` | `AT+CGSN` / `AT+CGSN=0` |
-  | `"imsi"` | `AT+CIMI` |
-  | `"iccid"` | `c:VintageNetECM.Modem.iccid/1` |
-  | `"registration"` | `AT+CEREG?` |
-  | `"signal_dbm"` | `AT+CSQ` |
-  | `"operator"` | `AT+COPS?` |
-  | `"access_technology"` | `c:VintageNetECM.Modem.access_technology/1` |
-  | `"mcc"`, `"mnc"`, `"cell_id"`, `"tac"`, `"band"`, `"channel"`, `"rsrp_dbm"`, `"rsrq_db"`, `"sinr_db"` | `c:VintageNetECM.Modem.network_info/1` |
-  | `"timezone"`, `"utc_offset"`, `"dst_offset"` | `c:VintageNetECM.Modem.network_time/1`, falling back to `AT+CCLK?` |
-
-  The current time is deliberately *not* a property — it would be stale the moment it
-  was published. Read it with `VintageNetECM.utc_now/1` instead.
+  Vendor-specific commands belong to `VintageNetECM.Modem`. Teardown runs after
+  VintageNet stops its children, so `deactivate_data_call/3` uses a temporary
+  supervisor and channel rather than accessing a UART directly.
   """
-
   use GenServer
   require Logger
-
-  alias VintageNetECM.AT
-  alias VintageNetECM.Modem
+  alias VintageNetECM.{AT, Modem}
 
   @monitor_interval 30_000
   @register_poll 3_000
-
-  # Identity properties: read once, then retried on each monitor tick until answered.
   @static_properties ~w(manufacturer model firmware_version imei serial_number imsi iccid)
-
-  # Keys of `t:VintageNetECM.Modem.network_info/0`, published under their own names.
   @network_info_properties [
     :mcc,
     :mnc,
@@ -77,172 +40,221 @@ defmodule VintageNetECM.ATController do
     :sinr_db
   ]
 
-  @typedoc ~s(The name of a property published under `["interface", ifname, "mobile", ...]`.)
   @type property :: String.t()
 
   @doc false
   def start_link(opts) do
-    ifname = Keyword.fetch!(opts, :ifname)
-    GenServer.start_link(__MODULE__, opts, name: via(ifname))
+    GenServer.start_link(__MODULE__, opts, name: server(Keyword.fetch!(opts, :ifname)))
   end
 
-  # Registered in VintageNet's own registry, keyed like VintageNet.Interface.Supervisor,
-  # so the controller can be reached by ifname alone (see `network_time/1`).
-  defp via(ifname), do: {:via, Registry, {VintageNet.Interface.Registry, {__MODULE__, ifname}}}
+  defp server(ifname), do: {:via, Registry, {VintageNet.Interface.Registry, {__MODULE__, ifname}}}
 
-  @doc """
-  Ask the modem what time the network says it is.
+  @doc false
+  def channel(ifname) do
+    GenServer.call(server(ifname), :channel, 5_000)
+  catch
+    :exit, {:noproc, _} -> {:error, :not_running}
+    :exit, _ -> {:error, :not_ready}
+  end
 
-  The AT tty is owned by this GenServer, so the query is serialized with the rest of
-  the lifecycle rather than opening a second connection. Returns
-  `{:error, :not_running}` if `ifname` has no `VintageNetECM` controller.
-  """
+  @doc "Query network time through an exclusive AT session."
   @spec network_time(VintageNet.ifname()) :: {:ok, Modem.network_time()} | {:error, term()}
   def network_time(ifname) do
-    GenServer.call(via(ifname), :network_time, 10_000)
+    GenServer.call(server(ifname), :network_time, 10_000)
   catch
-    :exit, _reason -> {:error, :not_running}
+    :exit, {:noproc, _} -> {:error, :not_running}
+    :exit, _ -> {:error, :outcome_unknown}
   end
 
-  @doc """
-  Send an arbitrary AT command to the modem on `ifname` and return its response.
-
-  Like `network_time/1`, the command goes through this GenServer so it's serialized
-  with the lifecycle's own AT traffic. See `VintageNetECM.command/3`.
-  """
-  @spec command(VintageNet.ifname(), String.t(), keyword()) ::
-          {:ok, [String.t()]} | {:error, term()}
-  def command(ifname, cmd, opts \\ []) do
-    timeout = Keyword.get(opts, :timeout, 5_000)
-    # Leave headroom over the AT timeout for a command already in flight on the tty.
-    GenServer.call(via(ifname), {:command, cmd, timeout}, timeout + 10_000)
-  catch
-    :exit, _reason -> {:error, :not_running}
-  end
-
-  @doc """
-  Tear the modem's ECM data call down. Invoked from `VintageNetECM` `down_cmds`, where
-  the controller GenServer is already gone — so this opens its own short-lived UART and
-  delegates the actual command to the `VintageNetECM.Modem` implementation.
-  """
-  @spec deactivate_data_call(module(), String.t(), pos_integer()) :: :ok
+  @doc false
   def deactivate_data_call(modem, tty, context_id) do
-    case AT.open(tty) do
-      {:ok, uart} ->
-        _ = modem.deactivate_data_call(uart, context_id)
-        AT.close(uart)
+    {:ok, supervisor} = Supervisor.start_link([], strategy: :one_for_one)
 
-      {:error, reason} ->
-        Logger.warning("[VintageNetECM] deactivate: could not open #{tty}: #{inspect(reason)}")
-        :ok
+    try do
+      case Supervisor.start_child(supervisor, {AT.Channel, tty: tty}) do
+        {:ok, channel} ->
+          AT.session(channel, &modem.deactivate_data_call(&1, context_id), timeout: 6_000)
+
+        {:error, reason} ->
+          Logger.warning("[VintageNetECM] deactivate: channel unavailable: #{inspect(reason)}")
+      end
+    after
+      Supervisor.stop(supervisor)
     end
+
+    :ok
   end
 
-  @impl GenServer
+  @impl true
   def init(opts) do
     state = %{
       ifname: Keyword.fetch!(opts, :ifname),
-      tty: Keyword.fetch!(opts, :tty),
+      channel: Keyword.fetch!(opts, :channel),
+      channel_pid: nil,
+      channel_monitor: nil,
+      ready: false,
+      at: nil,
       context_id: Keyword.get(opts, :context_id, 1),
       apn: Keyword.fetch!(opts, :apn),
-      modem: Keyword.get(opts, :modem, VintageNetECM.Modem.Quectel),
-      uart: nil,
+      modem: Keyword.get(opts, :modem, Modem.Quectel),
       static: Map.new(@static_properties, &{&1, nil})
     }
 
-    {:ok, state, {:continue, :open}}
+    {:ok, state, {:continue, :initialize}}
   end
 
-  @impl GenServer
-  def handle_continue(:open, state) do
-    case AT.open(state.tty) do
-      {:ok, uart} ->
-        state = %{state | uart: uart}
-        configure_radio(state)
-        state = refresh_static_properties(state)
-        send(self(), :check_registration)
-        {:noreply, state}
+  @impl true
+  def handle_continue(:initialize, state) do
+    state = watch_channel(state)
 
-      {:error, reason} ->
-        Logger.warning(
-          "[VintageNetECM] #{state.ifname}: open #{state.tty} failed: #{inspect(reason)}; retrying"
-        )
+    result =
+      AT.session(
+        state.channel_pid,
+        fn at ->
+          state = %{state | at: at}
 
-        Process.send_after(self(), :open, 5_000)
-        {:noreply, state}
+          with :ok <- configure_radio(state) do
+            {:initialized, refresh_static_properties(state)}
+          end
+        end,
+        timeout: 120_000
+      )
+
+    with {:initialized, initialized} <- result,
+         :ok <- AT.session(state.channel_pid, fn _ -> :ok end) do
+      send(self(), :check_registration)
+      {:noreply, %{initialized | at: nil, ready: true}}
+    else
+      _ ->
+        Process.send_after(self(), :initialize, @register_poll)
+        {:noreply, %{state | ready: false}}
     end
   end
 
-  @impl GenServer
-  def handle_info(:open, state), do: {:noreply, state, {:continue, :open}}
+  @impl true
+  def handle_info(:initialize, %{ready: true} = state), do: {:noreply, state}
+  def handle_info(:initialize, state), do: {:noreply, state, {:continue, :initialize}}
+
+  def handle_info({:DOWN, monitor, :process, _, _}, %{channel_monitor: monitor} = state) do
+    send(self(), :initialize)
+    {:noreply, %{state | ready: false, channel_pid: nil, channel_monitor: nil}}
+  end
+
+  def handle_info(event, %{ready: false} = state) when event in [:monitor, :check_registration],
+    do: {:noreply, state}
 
   def handle_info(:check_registration, state) do
-    if registered?(state.uart) do
-      Logger.info("[VintageNetECM] #{state.ifname}: registered, activating data call")
-      activate_data_call(state)
-      publish(state)
-      Process.send_after(self(), :monitor, @monitor_interval)
-    else
-      Process.send_after(self(), :check_registration, @register_poll)
-    end
+    result =
+      AT.session(
+        state.channel_pid,
+        fn at ->
+          state = %{state | at: at}
 
+          if registered?(at) do
+            activate_data_call(state)
+            publish(state)
+            :registered
+          else
+            :searching
+          end
+        end,
+        timeout: 60_000
+      )
+
+    event = if result == :registered, do: :monitor, else: :check_registration
+    delay = if event == :monitor, do: @monitor_interval, else: @register_poll
+    Process.send_after(self(), event, delay)
     {:noreply, state}
   end
 
   def handle_info(:monitor, state) do
-    # The SIM and radio may not have been ready when we first asked, so keep trying.
-    state = refresh_static_properties(state)
-    publish(state)
+    result =
+      AT.session(
+        state.channel_pid,
+        fn at ->
+          state = refresh_static_properties(%{state | at: at})
+          publish(state)
 
-    if registered?(state.uart) and not state.modem.data_call_active?(state.uart) do
-      Logger.info("[VintageNetECM] #{state.ifname}: data call down; re-activating")
-      activate_data_call(state)
-    end
+          if registered?(at) and not state.modem.data_call_active?(at) do
+            activate_data_call(state)
+          end
 
-    Process.send_after(self(), :monitor, @monitor_interval)
-    {:noreply, state}
+          %{state | at: nil}
+        end,
+        timeout: 60_000
+      )
+
+    Process.send_after(
+      self(),
+      :monitor,
+      if(is_map(result), do: @monitor_interval, else: @register_poll)
+    )
+
+    {:noreply, if(is_map(result), do: result, else: state)}
   end
 
-  @impl GenServer
-  def handle_call(_request, _from, %{uart: nil} = state) do
-    {:reply, {:error, :tty_not_open}, state}
+  @impl true
+  def handle_call(:channel, _from, state) do
+    result =
+      if state.ready and state.channel_pid == GenServer.whereis(state.channel),
+        do: {:ok, state.channel_pid},
+        else: {:error, :not_ready}
+
+    {:reply, result, state}
   end
+
+  def handle_call(:network_time, _from, %{ready: false} = state),
+    do: {:reply, {:error, :not_ready}, state}
 
   def handle_call(:network_time, _from, state) do
-    {:reply, network_time(state.modem, state.uart), state}
+    result = AT.session(state.channel_pid, &network_time(state.modem, &1))
+    {:reply, result, state}
   end
 
-  def handle_call({:command, cmd, timeout}, _from, state) do
-    {:reply, AT.command(state.uart, cmd, timeout: timeout), state}
+  @impl true
+  def format_status(status) do
+    Map.new(status, fn
+      {:log, _} -> {:log, []}
+      {key, _} when key in [:state, :message, :reason] -> {key, :redacted}
+      entry -> entry
+    end)
   end
 
-  # --- modem interactions -------------------------------------------------------
+  defp watch_channel(state) do
+    pid = GenServer.whereis(state.channel)
+
+    if pid == state.channel_pid do
+      state
+    else
+      if state.channel_monitor, do: Process.demonitor(state.channel_monitor, [:flush])
+      %{state | channel_pid: pid, channel_monitor: if(pid, do: Process.monitor(pid))}
+    end
+  end
 
   defp configure_radio(state) do
     [
+      "ATQ0V1",
       "ATE0",
       "AT+CMEE=1",
       "AT+CEREG=2",
       "AT+CFUN=1",
-      # Take the time and timezone from the network (NITZ) — modems ship with this
-      # off. 3GPP TS 27.007 only defines 0 and 1, so ask for 1 first, which every
-      # modem takes, then for Quectel's 3, which additionally writes local time to
-      # the RTC that the AT+CCLK? fallback reads.
+      # Standard NITZ first; Quectel's 3 also updates the RTC used by CCLK.
       "AT+CTZU=1",
       "AT+CTZU=3",
       ~s(AT+CGDCONT=#{state.context_id},"IP","#{state.apn}"),
       "AT+COPS=0"
     ]
-    |> Enum.each(fn cmd ->
-      case AT.command(state.uart, cmd, timeout: 5_000) do
-        {:ok, _} -> :ok
-        other -> Logger.debug("[VintageNetECM] #{state.ifname}: #{cmd} -> #{inspect(other)}")
+    |> Enum.reduce_while(:ok, fn cmd, :ok ->
+      case AT.command(state.at, cmd, timeout: 5_000) do
+        {:ok, _} -> {:cont, :ok}
+        {:error, reason} when reason == :error or is_tuple(reason) -> {:cont, :ok}
+        error -> {:halt, error}
       end
     end)
   end
 
   defp activate_data_call(state) do
-    case state.modem.activate_data_call(state.uart, state.context_id) do
+    case state.modem.activate_data_call(state.at, state.context_id) do
       :ok ->
         :ok
 
@@ -251,12 +263,9 @@ defmodule VintageNetECM.ATController do
     end
   end
 
-  # The three registration reports, the packet attach and the operator in one
-  # exchange; a modem that refuses any of them on one line is asked `AT+CEREG?` alone.
-  defp registered?(uart) do
-    with {:error, _} <-
-           AT.command(uart, "AT+CEREG?;+CGREG?;+CREG?;+CGATT?;+COPS?", timeout: 2_000),
-         {:error, _} <- AT.command(uart, "AT+CEREG?", timeout: 2_000) do
+  defp registered?(at) do
+    with {:error, _} <- AT.command(at, "AT+CEREG?;+CGREG?;+CREG?;+CGATT?;+COPS?", timeout: 2_000),
+         {:error, _} <- AT.command(at, "AT+CEREG?", timeout: 2_000) do
       false
     else
       {:ok, lines} -> parse_registered?(lines)
@@ -266,10 +275,10 @@ defmodule VintageNetECM.ATController do
   defp publish(state) do
     properties =
       [
-        {"registration", registration(state.uart)},
-        {"signal_dbm", signal_dbm(state.uart)},
-        {"operator", operator(state.uart)},
-        {"access_technology", state.modem.access_technology(state.uart)}
+        {"registration", registration(state.at)},
+        {"signal_dbm", signal_dbm(state.at)},
+        {"operator", operator(state.at)},
+        {"access_technology", state.modem.access_technology(state.at)}
       ] ++ network_info_properties(state) ++ time_properties(state)
 
     put_properties(state.ifname, properties)
@@ -282,12 +291,12 @@ defmodule VintageNetECM.ATController do
   end
 
   defp network_info_properties(state) do
-    info = state.modem.network_info(state.uart)
+    info = state.modem.network_info(state.at)
     Enum.map(@network_info_properties, &{Atom.to_string(&1), Map.get(info, &1)})
   end
 
   defp time_properties(state) do
-    case network_time(state.modem, state.uart) do
+    case network_time(state.modem, state.at) do
       {:ok, %{utc_offset: utc_offset, dst_offset: dst_offset}} ->
         [
           {"timezone", format_offset(utc_offset)},
@@ -295,12 +304,11 @@ defmodule VintageNetECM.ATController do
           {"dst_offset", dst_offset}
         ]
 
-      {:error, _reason} ->
+      {:error, _} ->
         [{"timezone", nil}, {"utc_offset", nil}, {"dst_offset", nil}]
     end
   end
 
-  # Read whatever identity properties we don't have yet and publish just those.
   defp refresh_static_properties(state) do
     read =
       state.static
@@ -315,67 +323,63 @@ defmodule VintageNetECM.ATController do
     end
   end
 
-  defp read_static_property(state, "manufacturer"), do: bare_line(state.uart, "AT+CGMI")
-  defp read_static_property(state, "model"), do: bare_line(state.uart, "AT+CGMM")
-  defp read_static_property(state, "firmware_version"), do: bare_line(state.uart, "AT+CGMR")
-  defp read_static_property(state, "imei"), do: bare_line(state.uart, "AT+CGSN")
-  defp read_static_property(state, "imsi"), do: bare_line(state.uart, "AT+CIMI")
+  defp read_static_property(state, "manufacturer"), do: bare_line(state.at, "AT+CGMI")
+  defp read_static_property(state, "model"), do: bare_line(state.at, "AT+CGMM")
+  defp read_static_property(state, "firmware_version"), do: bare_line(state.at, "AT+CGMR")
+  defp read_static_property(state, "imei"), do: bare_line(state.at, "AT+CGSN")
+  defp read_static_property(state, "imsi"), do: bare_line(state.at, "AT+CIMI")
 
   defp read_static_property(state, "serial_number") do
-    case AT.command(state.uart, "AT+CGSN=0", timeout: 2_000) do
+    case AT.command(state.at, "AT+CGSN=0", timeout: 2_000) do
       {:ok, lines} -> parse_serial_number(lines)
       _ -> nil
     end
   end
 
   defp read_static_property(state, "iccid") do
-    case state.modem.iccid(state.uart) do
+    case state.modem.iccid(state.at) do
       {:ok, iccid} -> iccid
-      {:error, _reason} -> nil
+      _ -> nil
     end
   end
 
-  defp registration(uart) do
-    case AT.command(uart, "AT+CEREG?", timeout: 2_000) do
+  defp registration(at) do
+    case AT.command(at, "AT+CEREG?", timeout: 2_000) do
       {:ok, lines} -> parse_registration(lines)
       _ -> :unknown
     end
   end
 
-  defp signal_dbm(uart) do
-    case AT.command(uart, "AT+CSQ", timeout: 2_000) do
+  defp signal_dbm(at) do
+    case AT.command(at, "AT+CSQ", timeout: 2_000) do
       {:ok, lines} -> parse_signal_dbm(lines)
       _ -> nil
     end
   end
 
-  defp operator(uart) do
-    case AT.command(uart, "AT+COPS?", timeout: 2_000) do
+  defp operator(at) do
+    case AT.command(at, "AT+COPS?", timeout: 2_000) do
       {:ok, lines} -> parse_operator(lines)
       _ -> nil
     end
   end
 
-  # The modem's own command is preferred — it reports what the *network* said. The
-  # standard RTC is only a fallback, since it starts at the epoch and is only correct
-  # once something (NITZ, `AT+CTZU=3`, ...) has set it.
-  defp network_time(modem, uart) do
-    case modem.network_time(uart) do
-      {:ok, network_time} -> {:ok, network_time}
-      {:error, _reason} -> clock_time(uart)
+  defp network_time(modem, at) do
+    case modem.network_time(at) do
+      {:ok, time} -> {:ok, time}
+      {:error, _} -> clock_time(at)
     end
   end
 
-  defp clock_time(uart) do
-    case AT.command(uart, "AT+CCLK?", timeout: 2_000) do
+  defp clock_time(at) do
+    case AT.command(at, "AT+CCLK?", timeout: 2_000) do
       {:ok, lines} -> parse_clock(lines)
       {:error, reason} -> {:error, reason}
     end
   end
 
-  # Commands like AT+CGMI answer with a bare value line and no `+CMD:` prefix.
-  defp bare_line(uart, cmd) do
-    with {:ok, lines} <- AT.command(uart, cmd, timeout: 2_000),
+  defp bare_line(at, cmd) do
+    with {:ok, lines} <- AT.command(at, cmd, timeout: 2_000),
          value when value not in [nil, ""] <-
            lines |> List.first() |> to_string() |> String.trim() do
       value
@@ -387,13 +391,10 @@ defmodule VintageNetECM.ATController do
   defp format_offset(seconds) do
     sign = if seconds < 0, do: "-", else: "+"
     minutes = div(abs(seconds), 60)
-
     "#{sign}#{pad(div(minutes, 60))}:#{pad(rem(minutes, 60))}"
   end
 
   defp pad(number), do: number |> Integer.to_string() |> String.pad_leading(2, "0")
-
-  # --- pure response parsing (exposed for tests) --------------------------------
 
   @typedoc false
   @type registration ::
@@ -404,11 +405,6 @@ defmodule VintageNetECM.ATController do
           | :not_registered
 
   @doc false
-  # Registered: any of `+CEREG`, `+CGREG` or `+CREG` at stat 1 (home) or 5 (roaming),
-  # or `+CGATT: 1` with an operator in `+COPS`. A modem can stay attached and carry
-  # data while every registration report reads searching (2), as a Quectel EG800Q
-  # does when a manual selection cuts short its automatic search and automatic
-  # selection is then restored.
   @spec parse_registered?([String.t()]) :: boolean()
   def parse_registered?(lines) do
     Enum.any?(lines, &Regex.match?(~r/^\+C(E|G)?REG:\s*\d+,[15](,|$)/, &1)) or
@@ -437,7 +433,6 @@ defmodule VintageNetECM.ATController do
   end
 
   @doc false
-  # `+CSQ: <rssi 0..31|99>,<ber>`. dBm = -113 + 2*rssi; 99 = unknown.
   @spec parse_signal_dbm([String.t()]) :: integer() | nil
   def parse_signal_dbm(lines) do
     Enum.find_value(lines, fn line ->
@@ -450,7 +445,6 @@ defmodule VintageNetECM.ATController do
   end
 
   @doc false
-  # `+CGSN: <SN>` — the module's serial number, which some firmware quotes.
   @spec parse_serial_number([String.t()]) :: String.t() | nil
   def parse_serial_number(lines) do
     Enum.find_value(lines, fn line ->
@@ -462,9 +456,6 @@ defmodule VintageNetECM.ATController do
   end
 
   @doc false
-  # `+COPS: <mode>[,<format>,<oper>[,<Act>]]` — `<oper>` is missing when no operator
-  # is selected. Its format follows `<format>`; the controller leaves `AT+COPS` at the
-  # default 0 (long alphanumeric), so this is normally the operator's name.
   @spec parse_operator([String.t()]) :: String.t() | nil
   def parse_operator(lines) do
     Enum.find_value(lines, fn line ->
@@ -477,10 +468,6 @@ defmodule VintageNetECM.ATController do
   end
 
   @doc false
-  # `+CCLK: "yy/MM/dd,hh:mm:ss±zz"` — *local* time, with ±zz the offset from UTC in
-  # quarter hours. 3GPP TS 27.007 has no daylight-saving field here, so `:dst_offset`
-  # is always 0; use a modem that implements `c:VintageNetECM.Modem.network_time/1`
-  # if you need to tell DST apart from a standard offset.
   @spec parse_clock([String.t()]) :: {:ok, Modem.network_time()} | {:error, term()}
   def parse_clock(lines) do
     fields =
@@ -508,9 +495,6 @@ defmodule VintageNetECM.ATController do
   defp local_to_utc([year, month, day, hour, minute, second], utc_offset) do
     with {:ok, date} <- Date.new(2000 + year, month, day),
          {:ok, time} <- Time.new(hour, minute, second),
-         # The wall clock is built in "Etc/UTC" — which never needs a timezone
-         # database, so DateTime.new/3's ambiguous/gap replies can't happen — and then
-         # shifted by the offset the modem reported.
          {:ok, local} <- unwrap(DateTime.new(date, time, "Etc/UTC")) do
       {:ok,
        %{utc: DateTime.add(local, -utc_offset, :second), utc_offset: utc_offset, dst_offset: 0}}
@@ -518,5 +502,5 @@ defmodule VintageNetECM.ATController do
   end
 
   defp unwrap({:ok, datetime}), do: {:ok, datetime}
-  defp unwrap(_other), do: {:error, :invalid_time}
+  defp unwrap(_), do: {:error, :invalid_time}
 end

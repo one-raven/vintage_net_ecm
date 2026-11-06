@@ -40,45 +40,46 @@ defmodule VintageNetECM.Modem.Quectel do
   def default_at_tty, do: "ttyUSB2"
 
   @impl VintageNetECM.Modem
-  def activate_data_call(uart, context_id) do
-    # A call the network dropped can still read as asked up, so it is asked down
-    # first and every request starts from no call.
-    _ = AT.command(uart, "AT+QNETDEVCTL=0,#{context_id},1", timeout: 5_000)
+  def activate_data_call(at, context_id) do
+    # A call the network dropped can still read as asked up, so ask it down first.
+    # The channel fences further writes if that exchange has an uncertain outcome.
+    _ = AT.command(at, "AT+QNETDEVCTL=0,#{context_id},1", timeout: 5_000)
 
-    case AT.command(uart, "AT+QNETDEVCTL=1,#{context_id},1", timeout: 8_000) do
+    case AT.command(at, "AT+QNETDEVCTL=1,#{context_id},1", timeout: 8_000) do
       {:ok, _} -> :ok
       {:error, reason} -> {:error, reason}
     end
   end
 
   @impl VintageNetECM.Modem
-  def deactivate_data_call(uart, context_id) do
-    _ = AT.command(uart, "AT+QNETDEVCTL=0,#{context_id},1", timeout: 5_000)
+  def deactivate_data_call(at, context_id) do
+    _ = AT.command(at, "AT+QNETDEVCTL=0,#{context_id},1", timeout: 5_000)
     :ok
   end
 
   @impl VintageNetECM.Modem
-  def data_call_active?(uart) do
-    case AT.command(uart, "AT+QNETDEVSTATUS?", timeout: 2_000) do
+  def data_call_active?(at) do
+    case AT.command(at, "AT+QNETDEVSTATUS?", timeout: 2_000) do
       {:ok, lines} -> parse_data_call_active(lines)
       # No answer says nothing about the call, and re-dialling would take a
       # working call down first. An error answer counts as down.
-      {:error, :timeout} -> true
-      {:error, _} -> false
+      {:error, :error} -> false
+      {:error, {kind, _}} when kind in [:cme, :cms] -> false
+      {:error, _} -> true
     end
   end
 
   @impl VintageNetECM.Modem
-  def access_technology(uart) do
-    case AT.command(uart, "AT+QCSQ", timeout: 2_000) do
+  def access_technology(at) do
+    case AT.command(at, "AT+QCSQ", timeout: 2_000) do
       {:ok, lines} -> parse_access_technology(lines)
       _ -> nil
     end
   end
 
   @impl VintageNetECM.Modem
-  def iccid(uart) do
-    with {:ok, lines} <- AT.command(uart, "AT+QCCID", timeout: 2_000) do
+  def iccid(at) do
+    with {:ok, lines} <- AT.command(at, "AT+QCCID", timeout: 2_000) do
       case parse_iccid(lines) do
         nil -> {:error, :no_iccid}
         iccid -> {:ok, iccid}
@@ -87,26 +88,26 @@ defmodule VintageNetECM.Modem.Quectel do
   end
 
   @impl VintageNetECM.Modem
-  def network_info(uart) do
+  def network_info(at) do
     # Both are best-effort: QNWINFO knows the band/channel, QENG knows the cell.
     Map.merge(
-      query(uart, "AT+QNWINFO", &parse_nwinfo/1),
-      query(uart, ~s(AT+QENG="servingcell"), &parse_serving_cell/1)
+      query(at, "AT+QNWINFO", &parse_nwinfo/1),
+      query(at, ~s(AT+QENG="servingcell"), &parse_serving_cell/1)
     )
   end
 
   @impl VintageNetECM.Modem
-  def network_time(uart) do
+  def network_time(at) do
     # QLTS=1 asks for GMT rather than local time, so no timezone maths is needed to
     # get to UTC. The trailing offset still describes the *local* zone.
-    case AT.command(uart, "AT+QLTS=1", timeout: 2_000) do
+    case AT.command(at, "AT+QLTS=1", timeout: 2_000) do
       {:ok, lines} -> parse_network_time(lines)
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp query(uart, cmd, parser) do
-    case AT.command(uart, cmd, timeout: 2_000) do
+  defp query(at, cmd, parser) do
+    case AT.command(at, cmd, timeout: 2_000) do
       {:ok, lines} -> parser.(lines)
       _ -> %{}
     end

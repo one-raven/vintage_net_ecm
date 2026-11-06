@@ -29,6 +29,17 @@ defmodule VintageNetECMTest do
       assert normalized.ipv4 == %{method: :dhcp}
     end
 
+    test "validates configured intermediate response markers" do
+      config = base_config(%{intermediate_responses: ["> ", "DOWNLOAD\r\n"]})
+      normalized = VintageNetECM.normalize(config)
+      assert normalized.vintage_net_ecm.intermediate_responses == ["> ", "DOWNLOAD\r\n"]
+      assert VintageNetECM.normalize(base_config()).vintage_net_ecm.intermediate_responses == []
+
+      assert_raise ArgumentError, ~r/intermediate_responses/, fn ->
+        VintageNetECM.normalize(base_config(%{intermediate_responses: ["OK"]}))
+      end
+    end
+
     test "derives the default at_tty from the selected modem" do
       defmodule TtyOnlyModem do
         @behaviour VintageNetECM.Modem
@@ -112,19 +123,27 @@ defmodule VintageNetECMTest do
              ]
     end
 
-    test "appends the AT controller child spec", %{raw: raw} do
-      controller =
-        Enum.find(raw.child_specs, fn
-          {VintageNetECM.ATController, _opts} -> true
-          _ -> false
-        end)
+    test "starts the channel before the modem controller", %{raw: raw} do
+      assert [
+               {VintageNetECM.AT.Channel, channel_opts},
+               {VintageNetECM.ATController, controller_opts}
+             ] = Enum.take(raw.child_specs, -2)
 
-      assert {VintageNetECM.ATController, controller_opts} = controller
+      assert channel_opts[:tty] == "ttyUSB2"
+      assert channel_opts[:name] == VintageNetECM.channel_name("usb1")
+      assert controller_opts[:channel] == channel_opts[:name]
       assert controller_opts[:ifname] == "usb1"
-      assert controller_opts[:tty] == "ttyUSB2"
       assert controller_opts[:context_id] == 1
       assert controller_opts[:apn] == "super"
       assert controller_opts[:modem] == VintageNetECM.Modem.Quectel
+      refute Keyword.has_key?(controller_opts, :tty)
+    end
+
+    test "passes configured intermediate markers to the channel" do
+      config = base_config(%{intermediate_responses: ["> "]})
+      raw = VintageNetECM.to_raw_config("usb1", config, Application.get_all_env(:vintage_net))
+      {VintageNetECM.AT.Channel, options} = Enum.at(raw.child_specs, -2)
+      assert options[:intermediate_responses] == ["> "]
     end
 
     test "prepends teardown down_cmds that drop the data call and clear mobile props", %{raw: raw} do
