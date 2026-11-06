@@ -4,29 +4,11 @@
 
 defmodule VintageNetECM do
   @moduledoc """
-  A `VintageNet` technology for cellular modems whose data plane is a USB CDC-ECM
-  (or RNDIS) network interface — e.g. the Quectel EG800Q in `usbnet` ECM mode.
+  A VintageNet technology for USB CDC-ECM cellular modems.
 
-  Unlike `VintageNetMobile`, which dials a PPP link over a serial AT port, an
-  ECM-class modem exposes an ordinary Ethernet-like netdev (`usb0`/`usb1`/`wwan0`)
-  whose IP/DNS/route are obtained over DHCP once the modem's internal data call is
-  up. `VintageNetECM` therefore **composes** `VintageNetEthernet` for the IP plane and
-  adds an AT-control sidecar (`VintageNetECM.ATController`) that:
-
-    * ensures the radio is on (`AT+CFUN=1`), sets the APN (`AT+CGDCONT`), and selects
-      the operator automatically (`AT+COPS=0`),
-    * waits for the modem to register (`+CEREG` -> 1/5),
-    * brings the ECM data call up via the configured `VintageNetECM.Modem` so the
-      netdev gets carrier and DHCP can complete,
-    * monitors registration/signal and republishes them under
-      `["interface", ifname, "mobile", ...]`,
-    * deactivates the data call on teardown.
-
-  The vendor-specific AT details live behind the `VintageNetECM.Modem` behaviour. The
-  default implementation, `VintageNetECM.Modem.Quectel`, targets Quectel `usbnet` ECM
-  modems such as the EG800Q.
-
-  ## Configuration
+  Composes `VintageNetEthernet` for DHCP/IP with a supervised AT channel and
+  `VintageNetECM.ATController` for radio initialization, registration, data-call
+  management and modem properties. Vendor commands belong to `VintageNetECM.Modem`.
 
       VintageNet.configure("usb1", %{
         type: VintageNetECM,
@@ -34,20 +16,19 @@ defmodule VintageNetECM do
           service_providers: [%{apn: "super"}],
           at_tty: "ttyUSB2",
           context_id: 1,
+          intermediate_responses: ["> "],
           modem: VintageNetECM.Modem.Quectel
         }
       })
 
-  `:modem` selects the `VintageNetECM.Modem` implementation (defaults to
-  `VintageNetECM.Modem.Quectel`). `:at_tty` defaults to that modem's
-  `default_at_tty/0`. `:ipv4` defaults to `%{method: :dhcp}` (the only sensible mode
-  for ECM). Other `VintageNetEthernet` options (`:dhcpd`, static `:ipv4`,
-  `:mac_address`) pass through to the composed ethernet config.
+  `:modem` defaults to `VintageNetECM.Modem.Quectel`; `:at_tty` defaults to the
+  modem's `default_at_tty/0`. `:ipv4` defaults to `%{method: :dhcp}`. Other
+  `VintageNetEthernet` options pass through. Intermediate markers are exact byte
+  sequences, fixed for the channel lifetime (default `[]`).
   """
-
   @behaviour VintageNet.Technology
-
   alias VintageNet.Interface.RawConfig
+  alias VintageNetECM.AT
 
   @default_modem VintageNetECM.Modem.Quectel
   @default_context_id 1
@@ -72,11 +53,19 @@ defmodule VintageNetECM do
               "module, got: #{inspect(modem)}"
     end
 
+    markers = Map.get(ecm, :intermediate_responses, [])
+
+    unless AT.validate_intermediate_responses(markers) == :ok do
+      raise ArgumentError,
+            "VintageNetECM requires unambiguous intermediate_responses (at most 32 markers, 1–128 bytes each)"
+    end
+
     normalized_ecm =
       ecm
       |> Map.put(:modem, modem)
       |> Map.put_new(:at_tty, modem.default_at_tty())
       |> Map.put_new(:context_id, @default_context_id)
+      |> Map.put_new(:intermediate_responses, [])
 
     config
     |> Map.put(:vintage_net_ecm, normalized_ecm)
@@ -91,30 +80,33 @@ defmodule VintageNetECM do
     context_id = Map.fetch!(ecm, :context_id)
     modem = Map.fetch!(ecm, :modem)
     apn = ecm |> Map.fetch!(:service_providers) |> hd() |> Map.fetch!(:apn)
-
-    # Delegate the IP/DHCP plane to VintageNetEthernet. Its normalize/to_raw_config
-    # clauses match on `type: VintageNetEthernet`, so swap the type for the call. It
-    # only reads :ipv4 / :mac_address / :dhcpd, so the :vintage_net_ecm key is ignored.
     eth_config = Map.put(config, :type, VintageNetEthernet)
     %RawConfig{} = base = VintageNetEthernet.to_raw_config(ifname, eth_config, opts)
 
+    channel =
+      {AT.Channel,
+       [
+         tty: at_tty,
+         name: channel_name(ifname),
+         intermediate_responses: Map.fetch!(ecm, :intermediate_responses)
+       ]}
+
     controller =
       {VintageNetECM.ATController,
-       [ifname: ifname, tty: at_tty, context_id: context_id, apn: apn, modem: modem]}
+       [
+         ifname: ifname,
+         channel: channel_name(ifname),
+         context_id: context_id,
+         apn: apn,
+         modem: modem
+       ]}
 
     %{
       base
-      | # Keep this technology as ours so ioctl/type/persistence dispatch here, and
-        # persist our own config (with :vintage_net_ecm) rather than the ethernet one.
-        type: __MODULE__,
+      | type: __MODULE__,
         source_config: config,
-        # Run the AT controller alongside udhcpc + the InternetChecker that
-        # VintageNetEthernet already added. `required_ifnames` stays `[ifname]` (the
-        # ECM netdev) so VintageNet waits for the modem to enumerate first.
-        child_specs: base.child_specs ++ [controller],
-        # down_cmds run AFTER the child supervisor is killed, so the AT controller's
-        # GenServer is already gone — deactivate_data_call/2 opens its own short-lived
-        # UART. Prepend so the data call drops before `ip link set <ifname> down`.
+        child_specs: base.child_specs ++ [channel, controller],
+        # VintageNet stops the children before running down_cmds.
         down_cmds:
           [
             {:fun, VintageNetECM.ATController, :deactivate_data_call,
@@ -124,71 +116,69 @@ defmodule VintageNetECM do
     }
   end
 
-  @doc """
-  Ask the modem on `ifname` what time the network says it is, in UTC.
+  @doc false
+  def channel_name(ifname),
+    do: {:via, Registry, {VintageNet.Interface.Registry, {AT.Channel, ifname}}}
 
-      iex> VintageNetECM.utc_now("usb1")
-      {:ok, ~U[2026-08-08 17:04:31Z]}
-
-  This is a live AT query rather than a published property, so it costs a round trip
-  to the modem and can fail: `{:error, :not_running}` if `ifname` isn't configured for
-  `VintageNetECM`, `{:error, :not_synchronized}` if the modem hasn't picked the time up
-  from the network yet.
-
-  The local timezone is published as `["interface", ifname, "mobile", "timezone"]` —
-  see `VintageNetECM.ATController` for the full property list.
-  """
+  @doc "Ask the modem for the current network time in UTC."
   @spec utc_now(VintageNet.ifname()) :: {:ok, DateTime.t()} | {:error, term()}
   def utc_now(ifname) do
-    with {:ok, %{utc: utc}} <- VintageNetECM.ATController.network_time(ifname) do
-      {:ok, utc}
-    end
+    with {:ok, %{utc: utc}} <- network_time(ifname), do: {:ok, utc}
   end
 
-  @doc """
-  Like `utc_now/1`, but also reports the network's timezone.
-
-      iex> VintageNetECM.network_time("usb1")
-      {:ok, %{utc: ~U[2026-08-08 17:04:31Z], utc_offset: -25200, dst_offset: 3600}}
-
-  `:utc_offset` is the local timezone's offset from UTC in seconds, of which
-  `:dst_offset` seconds are daylight saving.
-  """
+  @doc "Read live network time, including UTC and daylight-saving offsets in seconds."
   @spec network_time(VintageNet.ifname()) ::
           {:ok, VintageNetECM.Modem.network_time()} | {:error, term()}
   defdelegate network_time(ifname), to: VintageNetECM.ATController
 
   @doc """
-  Send an arbitrary AT command to the modem on `ifname` and return its response.
+  Send a standard AT command on a configured interface through an exclusive session.
 
-      iex> VintageNetECM.command("usb1", "AT+CGMI")
-      {:ok, ["Quectel"]}
+  Echo and final OK are omitted. Modem errors retain their `:error`, `{:cme, detail}`
+  or `{:cms, detail}` reason. `:timeout` defaults to 5,000 ms. An unavailable modem
+  returns `:not_running` or `:not_ready`; a competing session returns `:busy`.
+  See `session/3` and `VintageNetECM.AT` for failure semantics.
 
-      iex> VintageNetECM.command("usb1", "AT+QENG=\\"servingcell\\"", timeout: 10_000)
-      {:ok, ["+QENG: \\"servingcell\\",\\"NOCONN\\",\\"LTE\\",..."]}
-
-  The command is sent over the AT tty that `VintageNetECM.ATController` already owns,
-  serialized with its own traffic, so there's no second connection to contend with.
-  The response lines come back with the command echo and the final `OK` stripped.
-
-  Errors are `{:error, {:cme, detail}}` / `{:error, {:cms, detail}}` for extended
-  errors, `{:error, :error}` for a bare `ERROR`, `{:error, :timeout}` if the modem
-  doesn't finish answering in time, `{:error, :tty_not_open}` while the controller is
-  still (re)opening the tty, and `{:error, :not_running}` if `ifname` isn't configured
-  for `VintageNetECM`.
-
-  Be careful with commands that change modem state (`AT+CFUN`, `AT+CGDCONT`, data-call
-  control, ...): the controller doesn't know about them and may undo or be confused by
-  them.
-
-  ## Options
-
-    * `:timeout` - milliseconds to wait for the modem's final result code (default
-      `5_000`). Raise it for slow commands such as `AT+COPS=?`.
+  Avoid changing radio/APN/data-call state behind the modem controller's back.
   """
   @spec command(VintageNet.ifname(), String.t(), keyword()) ::
           {:ok, [String.t()]} | {:error, term()}
-  defdelegate command(ifname, cmd, opts \\ []), to: VintageNetECM.ATController
+  def command(ifname, cmd, opts \\ []) do
+    session(ifname, &AT.command(&1, cmd, opts), opts)
+  end
+
+  @doc """
+  Lease a configured interface's AT channel after radio initialization.
+
+      VintageNetECM.session("usb1", fn at ->
+        VintageNetECM.AT.command(at, "AT+CGMI")
+      end)
+
+  Uses the same `AT.command/3`, `AT.send/2`, and `AT.receive/2` operations as a
+  standalone `VintageNetECM.AT.session/3`. Controller operations lease this same
+  channel, so polling cannot interrupt interactive commands. Competing sessions
+  return `:busy`; background polling defers until the channel is free.
+
+  The callback runs in the calling PID. Its result is preserved, exceptions
+  propagate, and handles cannot be transferred or reused. `:timeout` bounds all
+  channel access, not arbitrary callback code. Failed or incomplete exchanges
+  fence traffic; recovery must be explicit and uncertain writes are never retried.
+  See `VintageNetECM.AT.session/3` and `VintageNetECM.AT.Channel`.
+
+  Standalone applications supervise `VintageNetECM.AT.Channel` directly; no
+  VintageNet interface configuration or explicit open/close calls are needed.
+  """
+  @spec session(VintageNet.ifname(), (AT.session() -> term()), keyword()) :: term()
+  def session(ifname, callback, opts \\ []) do
+    with {:ok, deadline} <- AT.deadline(opts),
+         {:ok, channel} <- VintageNetECM.ATController.channel(ifname) do
+      remaining = AT.remaining(deadline)
+
+      if remaining > 0,
+        do: AT.session(channel, callback, timeout: remaining),
+        else: {:error, :timeout}
+    end
+  end
 
   @impl VintageNet.Technology
   def ioctl(_ifname, _command, _args), do: {:error, :unsupported}

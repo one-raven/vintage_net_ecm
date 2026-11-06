@@ -84,26 +84,26 @@ defmodule VintageNetECM.Modem do
   @doc """
   Bring the ECM data call up.
 
-  Called over the controller's open UART once the modem reports registered.
+  Called with an exclusive AT session once the modem reports registered.
   """
-  @callback activate_data_call(AT.uart(), context_id :: pos_integer()) ::
+  @callback activate_data_call(AT.session(), context_id :: pos_integer()) ::
               :ok | {:error, term()}
 
   @doc """
   Tear the ECM data call down.
 
-  Called on teardown over a fresh, short-lived UART (the controller GenServer is
-  already gone by then). Implementations should not assume any prior session
-  state and should return `:ok` even if the modem reports nothing to tear down.
+  Called on teardown in a supervised channel's exclusive AT session. Implementations
+  should not assume prior session state and should return `:ok` even if the modem
+  reports nothing to tear down. All communication must use `VintageNetECM.AT`.
   """
-  @callback deactivate_data_call(AT.uart(), context_id :: pos_integer()) ::
+  @callback deactivate_data_call(AT.session(), context_id :: pos_integer()) ::
               :ok | {:error, term()}
 
   @doc "Whether the ECM data call is currently active."
-  @callback data_call_active?(AT.uart()) :: boolean()
+  @callback data_call_active?(AT.session()) :: boolean()
 
   @doc "Current radio access technology (e.g. `\"LTE\"`), or `nil` if unknown."
-  @callback access_technology(AT.uart()) :: String.t() | nil
+  @callback access_technology(AT.session()) :: String.t() | nil
 
   @doc "Default AT control tty basename for this modem family, e.g. `\"ttyUSB2\"`."
   @callback default_at_tty() :: String.t()
@@ -115,7 +115,7 @@ defmodule VintageNetECM.Modem do
   (Quectel uses `AT+QCCID`) — so it lives here. Return `{:error, :unsupported}` if
   the modem has no such command.
   """
-  @callback iccid(AT.uart()) :: {:ok, String.t()} | {:error, term()}
+  @callback iccid(AT.session()) :: {:ok, String.t()} | {:error, term()}
 
   @doc """
   Report serving-cell and network details.
@@ -123,7 +123,7 @@ defmodule VintageNetECM.Modem do
   Return an empty map when the modem is not camped on a cell or exposes none of
   this. Partial maps are fine — see `t:network_info/0` for the keys.
   """
-  @callback network_info(AT.uart()) :: network_info()
+  @callback network_info(AT.session()) :: network_info()
 
   @doc """
   Read the time the modem last synchronized from the network.
@@ -133,5 +133,5 @@ defmodule VintageNetECM.Modem do
   Return `{:error, reason}` if the modem has the command but has not yet
   synchronized with the network.
   """
-  @callback network_time(AT.uart()) :: {:ok, network_time()} | {:error, term()}
+  @callback network_time(AT.session()) :: {:ok, network_time()} | {:error, term()}
 end

@@ -22,7 +22,8 @@ defmodule VintageNetECM.MixProject do
       ],
       docs: docs(),
       package: package(),
-      aliases: aliases()
+      aliases: aliases(),
+      elixirc_paths: if(Mix.env() == :test, do: ["lib", "test/support"], else: ["lib"])
     ]
   end
 
